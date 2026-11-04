@@ -204,3 +204,64 @@ def test_normalize_pdf_text_helper():
     assert "Paragraf 2 baris a baris b." in normalized
     # Tanda hubung tidak digabungkan
     assert "semi- konduktor" in normalized
+
+
+def test_short_title_and_long_paragraph_min_chunk_size():
+    title = "Judul Pendek"
+    long_para = (
+        "Ini adalah kalimat dalam paragraf yang cukup panjang dan berkalimat banyak untuk menguji ukuran chunk. "
+        * 28
+    )
+    full_text = f"{title}\n\n{long_para}"
+    doc = ParsedDocument(
+        path=Path("doc.md"), segments=[Segment(text=full_text, page=None)]
+    )
+    chunks = chunk_document(doc, max_chars=1000, overlap=150)
+    assert len(chunks) > 1
+
+    # Semua chunk kecuali yang terakhir panjangnya >= 400 karakter
+    for c in chunks[:-1]:
+        assert len(c.text) >= 400
+
+
+def test_extreme_parameters_no_hang_no_text_loss():
+    words = [f"kata{i}" for i in range(120)]
+    sample_text = " ".join(words)
+    doc = ParsedDocument(
+        path=Path("ekstrem.txt"),
+        segments=[Segment(text=sample_text, page=None)],
+    )
+
+    chunks = chunk_document(doc, max_chars=100, overlap=90)
+    assert len(chunks) > 0
+
+    all_chunk_text = " ".join(c.text for c in chunks)
+    for c in chunks:
+        assert len(c.text) <= 100
+
+    for w in words:
+        assert w in all_chunk_text
+
+
+def test_double_spaces_collapsed_in_pdf_not_markdown():
+    text_with_spaces = "tmux  menjaga   sesi\n    code_indent()"
+
+    # Segment PDF: spasi ganda dirapikan menjadi satu spasi
+    doc_pdf = ParsedDocument(
+        path=Path("doc.pdf"),
+        segments=[Segment(text=text_with_spaces, page=1)],
+    )
+    chunks_pdf = chunk_document(doc_pdf)
+    assert len(chunks_pdf) == 1
+    assert "tmux menjaga sesi" in chunks_pdf[0].text
+    assert "  " not in chunks_pdf[0].text
+
+    # Segment MD: indentasi dan spasi ganda tetap utuh
+    doc_md = ParsedDocument(
+        path=Path("doc.md"),
+        segments=[Segment(text=text_with_spaces, page=None)],
+    )
+    chunks_md = chunk_document(doc_md)
+    assert len(chunks_md) == 1
+    assert "tmux  menjaga   sesi" in chunks_md[0].text
+    assert "    code_indent()" in chunks_md[0].text
