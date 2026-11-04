@@ -36,12 +36,19 @@ def parse_file(path: Path | str) -> ParsedDocument:
             file_path, f"Ekstensi file '{file_path.name}' tidak didukung"
         )
 
-    if not file_path.exists():
-        raise ParseError(file_path, f"File tidak ditemukan: '{file_path}'")
+    try:
+        if not file_path.exists():
+            raise ParseError(file_path, f"File tidak ditemukan: '{file_path}'")
 
-    if not file_path.is_file():
-        raise ParseError(file_path, f"Path bukan file reguler: '{file_path}'")
+        if not file_path.is_file():
+            raise ParseError(file_path, f"Path bukan file reguler: '{file_path}'")
 
-    parser = _PARSERS[ext]
-    segments = parser(file_path)
-    return ParsedDocument(path=file_path, segments=segments)
+        parser = _PARSERS[ext]
+        segments = parser(file_path)
+        return ParsedDocument(path=file_path, segments=segments)
+    except (ParseError, UnsupportedFileType):
+        raise
+    except Exception as e:
+        raise ParseError(
+            file_path, f"Gagal memproses file '{file_path.name}': {e}"
+        ) from e
