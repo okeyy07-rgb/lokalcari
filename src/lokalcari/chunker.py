@@ -16,7 +16,7 @@ class Chunk:
 
 
 def normalize_pdf_text(text: str) -> str:
-    """Perapian teks PDF: gabungkan baris dalam paragraf, pertahankan baris kosong."""
+    """Perapian teks PDF: gabungkan baris dalam paragraf, rapikan spasi berlebih, pertahankan baris kosong."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     # Pisahkan paragraf berdasarkan 2 atau lebih newline (termasuk baris kosong dengan spasi)
     paragraphs = re.split(r"\n[ \t]*\n+", text)
@@ -24,6 +24,8 @@ def normalize_pdf_text(text: str) -> str:
     for para in paragraphs:
         # Ganti satu newline di dalam paragraf dengan satu spasi
         p_clean = re.sub(r"[ \t]*\n[ \t]*", " ", para).strip()
+        # Ubah deretan spasi/tab (2 atau lebih) di dalam baris menjadi satu spasi
+        p_clean = re.sub(r"[ \t]{2,}", " ", p_clean)
         if p_clean:
             cleaned_paras.append(p_clean)
     return "\n\n".join(cleaned_paras)
@@ -87,6 +89,7 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     start = 0
     text_len = len(text)
     last_cut = 0
+    min_new = int(0.4 * (max_chars - overlap))
 
     while start < text_len:
         # Lewati whitespace di awal
@@ -110,7 +113,7 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
         cut = -1
         for m in reversed(para_matches):
             c = start + m.start()
-            if c > min_cut:
+            if c - min_cut >= min_new:
                 cut = c
                 break
 
@@ -119,7 +122,7 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
             sent_matches = list(re.finditer(r"[.!?](?=[ \t\n\r]|$)", candidate))
             for m in reversed(sent_matches):
                 c = start + m.end()
-                if c > min_cut:
+                if c - min_cut >= min_new:
                     cut = c
                     break
 
@@ -128,7 +131,7 @@ def _chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
             space_matches = list(re.finditer(r"\s+", candidate))
             for m in reversed(space_matches):
                 c = start + m.start()
-                if c > min_cut:
+                if c - min_cut >= min_new:
                     cut = c
                     break
 
