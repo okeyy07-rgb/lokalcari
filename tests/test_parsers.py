@@ -2,6 +2,7 @@ import io
 from pathlib import Path
 
 import docx
+import pypdf
 import pytest
 
 from lokalcari.parsers import (
@@ -9,6 +10,7 @@ from lokalcari.parsers import (
     ParseError,
     Segment,
     UnsupportedFileType,
+    parse,
     parse_file,
     supported_extensions,
 )
@@ -250,3 +252,40 @@ def test_unsupported_extension_raises_unsupported_file_type(tmp_path: Path):
     with pytest.raises(UnsupportedFileType) as exc_info:
         parse_file(unsupported)
     assert unsupported.name in str(exc_info.value)
+    assert exc_info.type is UnsupportedFileType
+
+
+def test_parse_encrypted_pdf_raises_parse_error(tmp_path: Path):
+    pdf_bytes = create_minimal_pdf(["Dokumen rahasia terenkripsi"])
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    writer = pypdf.PdfWriter()
+    writer.append(reader)
+    writer.encrypt(user_password="password123", algorithm="RC4-128")
+
+    enc_pdf = tmp_path / "encrypted.pdf"
+    with open(enc_pdf, "wb") as f:
+        writer.write(f)
+
+    with pytest.raises(ParseError) as exc_info:
+        parse_file(enc_pdf)
+    assert enc_pdf.name in str(exc_info.value)
+    assert "terenkripsi" in str(exc_info.value) or "password" in str(exc_info.value)
+
+
+def test_parse_file_wraps_unexpected_exception_as_parse_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    txt_file = tmp_path / "error.txt"
+    txt_file.write_text("konten", encoding="utf-8")
+
+    def mock_parser(path: Path):
+        raise RuntimeError("Kesalahan tidak terduga dalam parser!")
+
+    monkeypatch.setitem(parse._PARSERS, ".txt", mock_parser)
+
+    with pytest.raises(ParseError) as exc_info:
+        parse_file(txt_file)
+
+    assert txt_file.name in str(exc_info.value)
+    assert "Kesalahan tidak terduga dalam parser!" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
