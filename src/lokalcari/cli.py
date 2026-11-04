@@ -9,6 +9,11 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def main():
+    """LokalCari: Aplikasi pencari dokumen pribadi 100% lokal."""
+
+
 @app.command()
 def version():
     """Tampilkan versi aplikasi."""
