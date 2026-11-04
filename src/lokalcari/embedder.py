@@ -116,10 +116,14 @@ class Embedder:
                     "Silakan jalankan 'lokalcari setup' terlebih dahulu."
                 ) from e
             raise EmbeddingError(f"Gagal memuat model embedding: {e}") from e
-        except (FileNotFoundError, OSError) as e:
+        except FileNotFoundError as e:
             raise ModelNotInstalled(
                 f"File model embedding tidak ditemukan di '{cache_dir}'. "
                 "Silakan jalankan 'lokalcari setup' terlebih dahulu."
+            ) from e
+        except OSError as e:
+            raise EmbeddingError(
+                f"Terjadi kesalahan I/O saat memuat model embedding: {e}"
             ) from e
         except Exception as e:
             raise EmbeddingError(f"Gagal memuat model embedding: {e}") from e
