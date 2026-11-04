@@ -147,6 +147,26 @@ def test_runtime_error_wrapped_as_embedding_error():
         embedder.embed_passages(["halo"])
 
 
+def test_permission_error_wrapped_as_embedding_error(tmp_path, monkeypatch):
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    (model_dir / "dummy.bin").write_text("ok")
+    monkeypatch.setenv("LOKALCARI_MODEL_DIR", str(model_dir))
+
+    from fastembed import TextEmbedding
+
+    class MockTextEmbedding(TextEmbedding):
+        def __init__(self, *args, **kwargs):
+            raise PermissionError("Access denied reading model file")
+
+    monkeypatch.setattr("fastembed.TextEmbedding", MockTextEmbedding)
+
+    embedder = Embedder()
+    with pytest.raises(EmbeddingError, match="Access denied reading model file") as exc_info:
+        embedder.embed_query("halo")
+    assert not isinstance(exc_info.value, ModelNotInstalled)
+
+
 def test_model_cache_dir_resolution(tmp_path, monkeypatch):
     # Default path
     monkeypatch.delenv("LOKALCARI_MODEL_DIR", raising=False)
@@ -175,7 +195,37 @@ def test_cli_setup_success(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Model berhasil disiapkan di" in result.output
     assert str(tmp_path) in result.output
-    assert "1.00 MB" in result.output
+    assert "Ukuran di disk: 1.00 MB" in result.output
+
+
+def test_cli_setup_disk_usage_with_hardlink_and_symlink(tmp_path, monkeypatch):
+    runner = CliRunner()
+
+    model_dir = tmp_path / "model_dir"
+    model_dir.mkdir()
+
+    f1 = model_dir / "file1.bin"
+    f1.write_bytes(b"A" * 1024 * 1024)  # 1 MB
+
+    # Hardlink f2 -> file fisik yang sama dengan f1 (tidak boleh dihitung ganda)
+    f2 = model_dir / "file2_hard.bin"
+    os.link(f1, f2)
+
+    # Symlink f3 -> symlink ke f1 (tidak boleh dihitung)
+    f3 = model_dir / "file3_sym.bin"
+    try:
+        f3.symlink_to(f1)
+    except (OSError, NotImplementedError):
+        pass
+
+    monkeypatch.setattr(
+        "lokalcari.embedder.download_model",
+        lambda: model_dir,
+    )
+
+    result = runner.invoke(app, ["setup"])
+    assert result.exit_code == 0
+    assert "Ukuran di disk: 1.00 MB" in result.output
 
 
 def test_cli_setup_network_error(monkeypatch):
@@ -196,18 +246,33 @@ def test_cli_setup_network_error(monkeypatch):
     assert "Traceback" not in result.output
 
 
-@pytest.mark.model
-def test_real_model_integration(monkeypatch):
-    """Uji integrasi dengan model embedding ONNX asli (hanya jika diaktifkan)."""
-    if os.environ.get("LOKALCARI_RUN_MODEL_TESTS") != "1":
-        pytest.skip("Test model dilewati karena LOKALCARI_RUN_MODEL_TESTS!=1")
+@pytest.fixture
+def block_network(monkeypatch):
+    """Blokir seluruh akses jaringan (DNS getaddrinfo, TCP connect/create_connection)."""
 
-    # Blokir akses jaringan pada socket level untuk membuktikan model 100% offline
     def guard_socket(*args, **kwargs):
-        raise OSError("Akses jaringan dilarang pada test model integrasi!")
+        raise OSError("Akses jaringan dilarang oleh penjaga offline!")
 
     monkeypatch.setattr(socket.socket, "connect", guard_socket)
     monkeypatch.setattr(socket, "create_connection", guard_socket)
+    monkeypatch.setattr(socket, "getaddrinfo", guard_socket)
+    return guard_socket
+
+
+def test_network_guard_blocks_connection(block_network):
+    """Kontrol negatif: pastikan usaha membuka koneksi/DNS melempar exception penjaga."""
+    with pytest.raises(OSError, match="Akses jaringan dilarang"):
+        socket.create_connection(("example.com", 80))
+
+    with pytest.raises(OSError, match="Akses jaringan dilarang"):
+        socket.getaddrinfo("example.com", 80)
+
+
+@pytest.mark.model
+def test_real_model_integration(block_network):
+    """Uji integrasi dengan model embedding ONNX asli (hanya jika diaktifkan)."""
+    if os.environ.get("LOKALCARI_RUN_MODEL_TESTS") != "1":
+        pytest.skip("Test model dilewati karena LOKALCARI_RUN_MODEL_TESTS!=1")
 
     embedder = Embedder()
     assert embedder.dim == 384
