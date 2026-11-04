@@ -1,4 +1,5 @@
 import os
+import socket
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ from lokalcari.embedder import (
     PASSAGE_PREFIX,
     QUERY_PREFIX,
     Embedder,
+    EmbeddingError,
     ModelNotInstalled,
     model_cache_dir,
 )
@@ -115,6 +117,36 @@ def test_model_not_installed_empty_directory(tmp_path, monkeypatch):
         embedder.embed_passages(["halo"])
 
 
+def test_model_not_installed_half_corrupt_directory(tmp_path, monkeypatch):
+    model_dir = tmp_path / "corrupt_model"
+    model_dir.mkdir(parents=True)
+    # File parsial atau snapshot tidak lengkap
+    (model_dir / "incomplete.tmp").write_text("dummy")
+
+    monkeypatch.setenv("LOKALCARI_MODEL_DIR", str(model_dir))
+    embedder = Embedder()
+
+    with pytest.raises(ModelNotInstalled, match="lokalcari setup"):
+        embedder.embed_query("halo")
+
+    with pytest.raises(ModelNotInstalled, match="lokalcari setup"):
+        embedder.embed_passages(["halo"])
+
+
+def test_runtime_error_wrapped_as_embedding_error():
+    class FailingBackend:
+        def embed(self, texts: list[str], batch_size: int = 32):
+            raise RuntimeError("Internal ONNX inference failure: memory allocation")
+
+    embedder = Embedder(backend=FailingBackend())
+
+    with pytest.raises(EmbeddingError, match="Internal ONNX inference failure"):
+        embedder.embed_query("halo")
+
+    with pytest.raises(EmbeddingError, match="Internal ONNX inference failure"):
+        embedder.embed_passages(["halo"])
+
+
 def test_model_cache_dir_resolution(tmp_path, monkeypatch):
     # Default path
     monkeypatch.delenv("LOKALCARI_MODEL_DIR", raising=False)
@@ -165,10 +197,17 @@ def test_cli_setup_network_error(monkeypatch):
 
 
 @pytest.mark.model
-def test_real_model_integration():
+def test_real_model_integration(monkeypatch):
     """Uji integrasi dengan model embedding ONNX asli (hanya jika diaktifkan)."""
     if os.environ.get("LOKALCARI_RUN_MODEL_TESTS") != "1":
         pytest.skip("Test model dilewati karena LOKALCARI_RUN_MODEL_TESTS!=1")
+
+    # Blokir akses jaringan pada socket level untuk membuktikan model 100% offline
+    def guard_socket(*args, **kwargs):
+        raise OSError("Akses jaringan dilarang pada test model integrasi!")
+
+    monkeypatch.setattr(socket.socket, "connect", guard_socket)
+    monkeypatch.setattr(socket, "create_connection", guard_socket)
 
     embedder = Embedder()
     assert embedder.dim == 384
