@@ -10,6 +10,10 @@ QUERY_PREFIX = "query: "
 PASSAGE_PREFIX = "passage: "
 
 
+class EmbeddingError(Exception):
+    """Exception ketika terjadi kegagalan saat inisialisasi model atau pembuatan embedding."""
+
+
 class ModelNotInstalled(Exception):
     """Exception ketika model embedding belum diunduh ke cache lokal."""
 
@@ -105,11 +109,20 @@ class Embedder:
                 cache_dir=str(cache_dir),
                 local_files_only=True,
             )
-        except Exception as e:
+        except ValueError as e:
+            if "Could not load model" in str(e):
+                raise ModelNotInstalled(
+                    f"Model embedding belum lengkap atau belum terpasang di '{cache_dir}'. "
+                    "Silakan jalankan 'lokalcari setup' terlebih dahulu."
+                ) from e
+            raise EmbeddingError(f"Gagal memuat model embedding: {e}") from e
+        except (FileNotFoundError, OSError) as e:
             raise ModelNotInstalled(
-                f"Model embedding belum terpasang di '{cache_dir}'. "
+                f"File model embedding tidak ditemukan di '{cache_dir}'. "
                 "Silakan jalankan 'lokalcari setup' terlebih dahulu."
             ) from e
+        except Exception as e:
+            raise EmbeddingError(f"Gagal memuat model embedding: {e}") from e
 
         return self._backend
 
@@ -124,8 +137,10 @@ class Embedder:
         passages = [f"{PASSAGE_PREFIX}{t}" for t in texts]
         try:
             vectors = list(backend.embed(passages, batch_size=batch_size))
-        except TypeError:
-            vectors = list(backend.embed(passages))
+        except (ModelNotInstalled, EmbeddingError):
+            raise
+        except Exception as e:
+            raise EmbeddingError(f"Gagal melakukan embedding passage: {e}") from e
 
         arr = np.array(vectors, dtype=np.float32)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -138,8 +153,10 @@ class Embedder:
         query = f"{QUERY_PREFIX}{text}"
         try:
             vectors = list(backend.embed([query], batch_size=1))
-        except TypeError:
-            vectors = list(backend.embed([query]))
+        except (ModelNotInstalled, EmbeddingError):
+            raise
+        except Exception as e:
+            raise EmbeddingError(f"Gagal melakukan embedding query: {e}") from e
 
         arr = np.array(vectors[0], dtype=np.float32)
         norm = np.linalg.norm(arr)
