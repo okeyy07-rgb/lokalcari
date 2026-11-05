@@ -934,15 +934,23 @@ def test_concurrent_insert_during_vector_cache_load(tmp_path):
         try:
             hits = s1.search(v1, top_k=5)
             assert inserted_concurrently is True
-            assert len(hits) >= 1
+            assert len(hits) == 1
             assert s1._cached_chunk_ids is not None
+            assert len(s1._cached_chunk_ids) == 1
             assert 0 not in s1._cached_chunk_ids
             assert s1._cached_matrix is not None
-            assert len(s1._cached_chunk_ids) == len(s1._cached_matrix)
-        except StoreError:
-            assert inserted_concurrently is True
+            assert len(s1._cached_matrix) == 1
+            assert hits[0].path == doc1_path.resolve()
         finally:
             s1._conn = real_conn
+
+        # Search kedua tanpa penulisan lain: cache dimuat ulang karena data_version berubah
+        hits2 = s1.search(v1, top_k=5)
+        assert s1._cached_chunk_ids is not None
+        assert len(s1._cached_chunk_ids) == 2
+        assert 0 not in s1._cached_chunk_ids
+        hit_paths = {h.path for h in hits2}
+        assert hit_paths == {doc1_path.resolve(), doc2_path.resolve()}
 
 
 def test_concurrent_delete_during_vector_cache_load(tmp_path):
@@ -1025,16 +1033,26 @@ def test_concurrent_delete_during_vector_cache_load(tmp_path):
         s1._conn = _InterceptingConn(real_conn)  # type: ignore
 
         try:
-            s1.search(v1, top_k=5)
+            hits = s1.search(v1, top_k=5)
             assert deleted_concurrently is True
             assert s1._cached_chunk_ids is not None
+            assert len(s1._cached_chunk_ids) == 2
             assert 0 not in s1._cached_chunk_ids
             assert s1._cached_matrix is not None
             for row in s1._cached_matrix:
                 norm = float(np.linalg.norm(row))
                 assert 0.99 <= norm <= 1.01
+            assert all(h.path != doc2_path.resolve() for h in hits)
         finally:
             s1._conn = real_conn
+
+        # Search kedua tanpa penulisan lain: cache dimuat ulang hanya memuat doc1
+        hits2 = s1.search(v1, top_k=5)
+        assert s1._cached_chunk_ids is not None
+        assert len(s1._cached_chunk_ids) == 1
+        assert 0 not in s1._cached_chunk_ids
+        assert len(hits2) == 1
+        assert hits2[0].path == doc1_path.resolve()
 
 
 def test_failed_search_releases_read_transaction(tmp_path):
@@ -1106,6 +1124,8 @@ def test_failed_search_releases_read_transaction(tmp_path):
 
         with pytest.raises(StoreError, match="Gagal memuat cache vektor"):
             s.search(v[0])
+
+        assert real_conn.in_transaction is False
 
         # Pulihkan koneksi asli
         s._conn = real_conn
