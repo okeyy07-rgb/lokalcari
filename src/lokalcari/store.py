@@ -183,7 +183,7 @@ class Store:
         """)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             page INTEGER,
@@ -412,6 +412,12 @@ class Store:
         conn = self._ensure_open()
         try:
             cur = conn.cursor()
+            # Baca data_version sebelum memuat data agar penulisan dari koneksi lain
+            # di tengah proses pemuatan tidak tertutup oleh versi yang lebih baru.
+            cur.execute("PRAGMA data_version;")
+            row = cur.fetchone()
+            initial_data_version = row[0] if row else 0
+
             cur.execute("SELECT count(*) FROM chunks;")
             total_chunks = cur.fetchone()[0]
 
@@ -432,9 +438,7 @@ class Store:
                 self._cached_matrix = matrix
                 self._cached_chunk_ids = chunk_ids
 
-            cur.execute("PRAGMA data_version;")
-            row = cur.fetchone()
-            self._cached_data_version = row[0] if row else 0
+            self._cached_data_version = initial_data_version
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
             raise self._handle_sqlite_error(e, "Gagal memuat cache vektor") from e
 
