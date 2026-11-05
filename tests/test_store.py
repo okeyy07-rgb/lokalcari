@@ -107,7 +107,7 @@ def test_upsert_same_path_replaces_all_chunks(tmp_path):
             chunks=_create_mock_chunks(doc_path, old_texts),
             vectors=_create_random_vectors(3, 384, seed=1),
         )
-        assert store.stats()["total_chunks"] == 3
+        assert store.stats()["chunks"] == 3
 
         # Ganti dengan 2 chunk baru
         new_texts = ["X", "Y"]
@@ -125,7 +125,7 @@ def test_upsert_same_path_replaces_all_chunks(tmp_path):
         assert doc is not None
         assert doc.content_hash == "hash_new"
         assert doc.chunk_count == 2
-        assert store.stats()["total_chunks"] == 2
+        assert store.stats()["chunks"] == 2
 
         # Pastikan hanya teks baru yang ada
         q = _create_random_vectors(1, 384, seed=2)[0]
@@ -149,15 +149,15 @@ def test_remove_document_and_cascade_delete(tmp_path):
             chunks=_create_mock_chunks(doc_path, ["Teks satu", "Teks dua"]),
             vectors=_create_random_vectors(2, 384),
         )
-        assert store.stats()["total_documents"] == 1
-        assert store.stats()["total_chunks"] == 2
+        assert store.stats()["documents"]["ok"] == 1
+        assert store.stats()["chunks"] == 2
 
         # Hapus dokumen
         removed = store.remove_document(doc_path)
         assert removed is True
         assert store.get_document(doc_path) is None
-        assert store.stats()["total_documents"] == 0
-        assert store.stats()["total_chunks"] == 0
+        assert store.stats()["documents"]["ok"] == 0
+        assert store.stats()["chunks"] == 0
 
         # Pencarian harus kosong
         q = _create_random_vectors(1, 384)[0]
@@ -346,8 +346,8 @@ def test_validation_errors(tmp_path):
             store.search(np.zeros(384, dtype=np.float64))
 
         # Pastikan database tetap bersih
-        assert store.stats()["total_documents"] == 0
-        assert store.stats()["total_chunks"] == 0
+        assert sum(store.stats()["documents"].values()) == 0
+        assert store.stats()["chunks"] == 0
 
 
 class _FailingChunk:
@@ -387,7 +387,7 @@ def test_atomicity_rollback_on_failure(tmp_path):
         doc_before = store.get_document(doc_path)
         assert doc_before is not None
         assert doc_before.content_hash == "hash_awal"
-        assert store.stats()["total_chunks"] == 2
+        assert store.stats()["chunks"] == 2
 
         # Coba perbarui dokumen dengan chunk yang gagal di chunk ke-3
         failing_chunks = [_FailingChunk(doc_path, i) for i in range(3)]
@@ -410,7 +410,7 @@ def test_atomicity_rollback_on_failure(tmp_path):
         assert doc is not None
         assert doc.content_hash == "hash_awal"
         assert doc.chunk_count == 2
-        assert store.stats()["total_chunks"] == 2
+        assert store.stats()["chunks"] == 2
 
         hits = store.search(init_vectors[0], top_k=5)
         assert len(hits) == 2
@@ -529,8 +529,8 @@ def test_empty_and_error_status_documents(tmp_path):
         stats = store.stats()
         assert stats["documents"]["empty"] == 1
         assert stats["documents"]["error"] == 1
-        assert stats["total_documents"] == 2
-        assert stats["total_chunks"] == 0
+        assert sum(stats["documents"].values()) == 2
+        assert stats["chunks"] == 0
 
 
 def test_utf8_indonesian_text_and_path_with_spaces(tmp_path):
@@ -600,9 +600,117 @@ def test_list_documents_and_stats(tmp_path):
         assert paths == {d1.resolve(), d2.resolve()}
 
         st = store.stats()
-        assert st["total_documents"] == 2
+        assert set(st.keys()) == {"documents", "chunks", "db_size_bytes"}
         assert st["documents"]["ok"] == 1
         assert st["documents"]["empty"] == 1
         assert st["documents"]["error"] == 0
-        assert st["total_chunks"] == 2
+        assert sum(st["documents"].values()) == 2
+        assert st["chunks"] == 2
         assert st["db_size_bytes"] > 0
+
+
+def test_cross_connection_cache_invalidation_data_version(tmp_path):
+    """Store A harus menyegarkan cache otomatis saat Store B menambah dokumen via PRAGMA data_version."""
+    db_file = tmp_path / "multi_conn.db"
+
+    v1 = _create_random_vectors(1, 384, seed=101)[0]
+    v2 = _create_random_vectors(1, 384, seed=102)[0]
+
+    with Store(db_file) as store_a, Store(db_file) as store_b:
+        d1 = tmp_path / "doc1.txt"
+        store_b.upsert_document(
+            d1,
+            content_hash="h1",
+            size=10,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(d1, ["Dokumen pertama"]),
+            vectors=np.array([v1]),
+        )
+
+        # Store A melakukan search pertama -> memuat cache ke memori
+        hits_a = store_a.search(v1, top_k=5)
+        assert len(hits_a) == 1
+        assert hits_a[0].text == "Dokumen pertama"
+        ver_before = store_a._cached_data_version
+        assert ver_before is not None
+
+        # Store B menambahkan dokumen kedua
+        d2 = tmp_path / "doc2.txt"
+        store_b.upsert_document(
+            d2,
+            content_hash="h2",
+            size=20,
+            mtime_ns=2,
+            status="ok",
+            chunks=_create_mock_chunks(d2, ["Dokumen kedua"]),
+            vectors=np.array([v2]),
+        )
+
+        # Buktikan data_version berubah dari koneksi Store A
+        conn_a = store_a._ensure_open()
+        cur_a = conn_a.cursor()
+        cur_a.execute("PRAGMA data_version;")
+        ver_after = cur_a.fetchone()[0]
+        assert ver_after != ver_before
+
+        # Store A melakukan pencarian lagi -> harus otomatis mendeteksi perubahan dan menemukan doc2
+        hits_a_new = store_a.search(v2, top_k=5)
+        assert len(hits_a_new) == 2
+        assert any(h.text == "Dokumen kedua" for h in hits_a_new)
+
+
+def test_locked_database_raises_store_error(tmp_path):
+    """Database yang terkunci proses lain harus melempar StoreError dengan pesan proses lain dan data lama aman."""
+    import sqlite3
+
+    db_file = tmp_path / "locked.db"
+    doc_path = tmp_path / "doc.txt"
+
+    # Inisialisasi dokumen awal
+    init_v = _create_random_vectors(1, 384, seed=201)
+    with Store(db_file) as s:
+        s.upsert_document(
+            doc_path,
+            content_hash="h_init",
+            size=50,
+            mtime_ns=100,
+            status="ok",
+            chunks=_create_mock_chunks(doc_path, ["Teks awal"]),
+            vectors=init_v,
+        )
+
+    # Buka koneksi sqlite3 terpisah dan tahan lock eksklusif dengan BEGIN IMMEDIATE
+    external_conn = sqlite3.connect(str(db_file), timeout=0.1)
+    external_conn.execute("BEGIN IMMEDIATE;")
+
+    try:
+        # Coba upsert dengan Store bertimeout rendah (0.1s)
+        new_v = _create_random_vectors(1, 384, seed=202)
+        with Store(db_file, timeout=0.1) as locked_store:
+            with pytest.raises(StoreError) as exc_info:
+                locked_store.upsert_document(
+                    doc_path,
+                    content_hash="h_new",
+                    size=100,
+                    mtime_ns=200,
+                    status="ok",
+                    chunks=_create_mock_chunks(doc_path, ["Teks baru"]),
+                    vectors=new_v,
+                )
+
+            err_msg = str(exc_info.value)
+            assert "sedang digunakan oleh proses lain" in err_msg
+            assert "rusak atau tidak valid" not in err_msg
+    finally:
+        external_conn.rollback()
+        external_conn.close()
+
+    # Pastikan data lama tetap utuh
+    with Store(db_file) as s_verify:
+        doc = s_verify.get_document(doc_path)
+        assert doc is not None
+        assert doc.content_hash == "h_init"
+        hits = s_verify.search(init_v[0], top_k=5)
+        assert len(hits) == 1
+        assert hits[0].text == "Teks awal"
