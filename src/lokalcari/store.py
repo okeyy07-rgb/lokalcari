@@ -61,13 +61,17 @@ class SearchHit:
 
 
 class Store:
-    """Penyimpanan dokumen, chunk, dan vektor ke file SQLite lokal."""
+    """Penyimpanan dokumen, chunk, dan vektor ke file SQLite lokal.
+
+    Satu objek Store hanya boleh dipakai dari satu thread; untuk thread lain, buka objek Store sendiri.
+    """
 
     def __init__(
         self,
         db_path: Path | str | None = None,
         model_name: str = DEFAULT_MODEL_NAME,
         embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+        timeout: float = 5.0,
     ) -> None:
         if db_path is None:
             self.db_path = default_db_path()
@@ -76,10 +80,12 @@ class Store:
 
         self.model_name = str(model_name)
         self.embedding_dim = int(embedding_dim)
+        self.timeout = float(timeout)
 
         self._conn: sqlite3.Connection | None = None
         self._cached_matrix: np.ndarray | None = None
-        self._cached_metadata: list[tuple[Path, int | None, int, str]] | None = None
+        self._cached_chunk_ids: list[int] | None = None
+        self._cached_data_version: int | None = None
 
         self._connect()
 
@@ -111,15 +117,24 @@ class Store:
         return self._conn
 
     def _invalidate_vector_cache(self) -> None:
-        """Menghapus cache matriks vektor dan metadata dalam memori."""
+        """Menghapus cache matriks vektor dan ID chunk dalam memori."""
         self._cached_matrix = None
-        self._cached_metadata = None
+        self._cached_chunk_ids = None
+        self._cached_data_version = None
+
+    @staticmethod
+    def _handle_sqlite_error(e: Exception, default_action: str) -> StoreError:
+        """Membungkus sqlite3.Error menjadi StoreError dengan pesan deskriptif."""
+        err_msg = str(e).lower()
+        if "database is locked" in err_msg or "locked" in err_msg or "busy" in err_msg:
+            return StoreError(f"Database sedang digunakan oleh proses lain: {e}")
+        return StoreError(f"{default_action}: {e}")
 
     def _connect(self) -> None:
         """Membuka koneksi SQLite, mengatur PRAGMA, dan inisialisasi skema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._conn = sqlite3.connect(str(self.db_path))
+            self._conn = sqlite3.connect(str(self.db_path), timeout=self.timeout)
             self._conn.execute("PRAGMA foreign_keys = ON;")
             self._conn.execute("PRAGMA journal_mode = WAL;")
             self._init_schema_and_meta()
@@ -128,6 +143,15 @@ class Store:
             raise
         except (sqlite3.DatabaseError, sqlite3.OperationalError, sqlite3.Error) as e:
             self.close()
+            err_msg = str(e).lower()
+            if (
+                "database is locked" in err_msg
+                or "locked" in err_msg
+                or "busy" in err_msg
+            ):
+                raise StoreError(
+                    f"Database sedang digunakan oleh proses lain: {e}"
+                ) from e
             raise StoreError(f"Database SQLite rusak atau tidak valid: {e}") from e
         except Exception:
             self.close()
@@ -304,7 +328,7 @@ class Store:
             self._invalidate_vector_cache()
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
             self._invalidate_vector_cache()
-            raise StoreError(f"Gagal melakukan upsert document: {e}") from e
+            raise self._handle_sqlite_error(e, "Gagal melakukan upsert document") from e
         except Exception:
             self._invalidate_vector_cache()
             raise
@@ -337,7 +361,7 @@ class Store:
                 indexed_at=row[7],
             )
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            raise StoreError(f"Gagal mengambil dokumen: {e}") from e
+            raise self._handle_sqlite_error(e, "Gagal mengambil dokumen") from e
 
     def list_documents(self) -> list[DocumentRecord]:
         """Mengambil daftar semua rekaman dokumen dalam store."""
@@ -366,7 +390,7 @@ class Store:
                 for r in rows
             ]
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            raise StoreError(f"Gagal mengambil daftar dokumen: {e}") from e
+            raise self._handle_sqlite_error(e, "Gagal mengambil daftar dokumen") from e
 
     def remove_document(self, path: Path | str) -> bool:
         """Menghapus dokumen dan seluruh chunk terkait (via cascade delete)."""
@@ -381,33 +405,38 @@ class Store:
                 self._invalidate_vector_cache()
             return removed
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            raise StoreError(f"Gagal menghapus dokumen: {e}") from e
+            raise self._handle_sqlite_error(e, "Gagal menghapus dokumen") from e
 
     def _load_vector_cache(self) -> None:
-        """Memuat semua vektor dan metadata chunk dari database ke memori."""
+        """Memuat semua vektor dan ID chunk dari database ke memori."""
         conn = self._ensure_open()
         try:
             cur = conn.cursor()
-            cur.execute("""
-                SELECT c.page, c.chunk_index, c.text, d.path, c.embedding
-                FROM chunks c
-                JOIN documents d ON c.document_id = d.id
-                ORDER BY c.id ASC;
-            """)
-            rows = cur.fetchall()
-            if not rows:
+            cur.execute("SELECT count(*) FROM chunks;")
+            total_chunks = cur.fetchone()[0]
+
+            if total_chunks == 0:
                 self._cached_matrix = np.empty(
                     (0, self.embedding_dim), dtype=np.float32
                 )
-                self._cached_metadata = []
+                self._cached_chunk_ids = []
             else:
-                raw_bytes = b"".join(r[4] for r in rows)
-                self._cached_matrix = np.frombuffer(
-                    raw_bytes, dtype=np.float32
-                ).reshape(len(rows), self.embedding_dim)
-                self._cached_metadata = [(Path(r[3]), r[0], r[1], r[2]) for r in rows]
+                matrix = np.empty((total_chunks, self.embedding_dim), dtype=np.float32)
+                chunk_ids = [0] * total_chunks
+
+                cur.execute("SELECT id, embedding FROM chunks ORDER BY id ASC;")
+                for i, (cid, blob) in enumerate(cur):
+                    chunk_ids[i] = cid
+                    matrix[i] = np.frombuffer(blob, dtype=np.float32)
+
+                self._cached_matrix = matrix
+                self._cached_chunk_ids = chunk_ids
+
+            cur.execute("PRAGMA data_version;")
+            row = cur.fetchone()
+            self._cached_data_version = row[0] if row else 0
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            raise StoreError(f"Gagal memuat cache vektor: {e}") from e
+            raise self._handle_sqlite_error(e, "Gagal memuat cache vektor") from e
 
     def search(self, query_vec: np.ndarray, top_k: int = 10) -> list[SearchHit]:
         """Mencari chunk terdekat menggunakan dot product vektor query."""
@@ -425,38 +454,70 @@ class Store:
         if top_k <= 0:
             return []
 
-        if self._cached_matrix is None or self._cached_metadata is None:
-            self._load_vector_cache()
+        conn = self._ensure_open()
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA data_version;")
+            row = cur.fetchone()
+            current_version = row[0] if row else 0
 
-        assert self._cached_matrix is not None
-        assert self._cached_metadata is not None
+            if (
+                self._cached_matrix is None
+                or self._cached_chunk_ids is None
+                or self._cached_data_version is None
+                or self._cached_data_version != current_version
+            ):
+                self._load_vector_cache()
 
-        num_chunks = len(self._cached_metadata)
-        if num_chunks == 0:
-            return []
+            assert self._cached_matrix is not None
+            assert self._cached_chunk_ids is not None
 
-        scores = self._cached_matrix @ query_vec
+            num_chunks = len(self._cached_chunk_ids)
+            if num_chunks == 0:
+                return []
 
-        if top_k >= num_chunks:
-            ranked_indices = np.argsort(scores)[::-1]
-        else:
-            partition_indices = np.argpartition(scores, -top_k)[-top_k:]
-            sorted_part = np.argsort(scores[partition_indices])[::-1]
-            ranked_indices = partition_indices[sorted_part]
+            scores = self._cached_matrix @ query_vec
 
-        hits: list[SearchHit] = []
-        for idx in ranked_indices:
-            path, page, chunk_index, text = self._cached_metadata[idx]
-            hits.append(
-                SearchHit(
-                    path=path,
-                    page=page,
-                    chunk_index=chunk_index,
-                    text=text,
-                    score=float(scores[idx]),
-                )
-            )
-        return hits
+            if top_k >= num_chunks:
+                ranked_indices = np.argsort(scores)[::-1]
+            else:
+                partition_indices = np.argpartition(scores, -top_k)[-top_k:]
+                sorted_part = np.argsort(scores[partition_indices])[::-1]
+                ranked_indices = partition_indices[sorted_part]
+
+            top_chunk_ids = [self._cached_chunk_ids[idx] for idx in ranked_indices]
+            top_scores = {
+                self._cached_chunk_ids[idx]: float(scores[idx])
+                for idx in ranked_indices
+            }
+
+            placeholders = ",".join("?" for _ in top_chunk_ids)
+            query = f"""
+                SELECT c.id, d.path, c.page, c.chunk_index, c.text
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.id IN ({placeholders});
+            """
+            cur.execute(query, top_chunk_ids)
+            rows = cur.fetchall()
+            row_map = {r[0]: (Path(r[1]), r[2], r[3], r[4]) for r in rows}
+
+            hits: list[SearchHit] = []
+            for cid in top_chunk_ids:
+                if cid in row_map:
+                    path, page, chunk_index, text = row_map[cid]
+                    hits.append(
+                        SearchHit(
+                            path=path,
+                            page=page,
+                            chunk_index=chunk_index,
+                            text=text,
+                            score=top_scores[cid],
+                        )
+                    )
+            return hits
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+            raise self._handle_sqlite_error(e, "Gagal melakukan pencarian") from e
 
     def stats(self) -> dict[str, Any]:
         """Mengembalikan statistik dokumen, chunk, dan ukuran file database."""
@@ -465,26 +526,24 @@ class Store:
             cur = conn.cursor()
             cur.execute("SELECT status, count(*) FROM documents GROUP BY status;")
             status_counts = {"ok": 0, "empty": 0, "error": 0}
-            total_docs = 0
             for status, count in cur.fetchall():
                 if status in status_counts:
                     status_counts[status] = count
-                total_docs += count
 
             cur.execute("SELECT count(*) FROM chunks;")
             chunk_count = cur.fetchone()[0]
 
             db_size = self.db_path.stat().st_size if self.db_path.exists() else 0
+            wal_path = Path(str(self.db_path) + "-wal")
+            if wal_path.exists():
+                db_size += wal_path.stat().st_size
 
             return {
                 "documents": status_counts,
-                "documents_by_status": status_counts,
-                "total_documents": total_docs,
-                "chunk_count": chunk_count,
-                "total_chunks": chunk_count,
                 "chunks": chunk_count,
                 "db_size_bytes": db_size,
-                "db_size": db_size,
             }
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-            raise StoreError(f"Gagal mengambil statistik database: {e}") from e
+            raise self._handle_sqlite_error(
+                e, "Gagal mengambil statistik database"
+            ) from e
