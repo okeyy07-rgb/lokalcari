@@ -851,3 +851,275 @@ def test_chunk_ids_autoincrement_never_reused(tmp_path):
     assert len(second_ids) == 2
     # Semua ID chunk setelah upsert kedua harus lebih besar dari semua ID sebelumnya
     assert min(second_ids) > max(first_ids)
+
+
+def test_concurrent_insert_during_vector_cache_load(tmp_path):
+    """Penyisipan konkuren di antara count(*) dan fetch embedding harus tetap konsisten tanpa IndexError mentah."""
+    db_file = tmp_path / "insert_race.db"
+    doc1_path = tmp_path / "doc1.txt"
+    doc2_path = tmp_path / "doc2.txt"
+
+    v1 = _create_random_vectors(1, 384, seed=501)[0]
+    v2 = _create_random_vectors(1, 384, seed=502)[0]
+
+    with Store(db_file) as s1, Store(db_file) as s2:
+        s2.upsert_document(
+            doc1_path,
+            content_hash="h1",
+            size=10,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(doc1_path, ["Dokumen 1"]),
+            vectors=np.array([v1]),
+        )
+
+        real_conn = s1._conn
+        assert real_conn is not None
+        inserted_concurrently = False
+
+        class _InterceptingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                nonlocal inserted_concurrently
+                res = self._cur.execute(sql, *args, **kwargs)
+                if "SELECT count(*) FROM chunks" in sql and not inserted_concurrently:
+                    s2.upsert_document(
+                        doc2_path,
+                        content_hash="h2",
+                        size=20,
+                        mtime_ns=2,
+                        status="ok",
+                        chunks=_create_mock_chunks(doc2_path, ["Dokumen 2"]),
+                        vectors=np.array([v2]),
+                    )
+                    inserted_concurrently = True
+                return res
+
+            def fetchone(self) -> Any:
+                return self._cur.fetchone()
+
+            def fetchall(self) -> Any:
+                return self._cur.fetchall()
+
+            def __iter__(self) -> Any:
+                return iter(self._cur)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+        class _InterceptingConn:
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def cursor(self) -> Any:
+                return _InterceptingCursor(self._conn.cursor())
+
+            def rollback(self) -> Any:
+                return self._conn.rollback()
+
+            @property
+            def in_transaction(self) -> bool:
+                return self._conn.in_transaction
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._conn, name)
+
+        s1._conn = _InterceptingConn(real_conn)  # type: ignore
+
+        try:
+            hits = s1.search(v1, top_k=5)
+            assert inserted_concurrently is True
+            assert len(hits) >= 1
+            assert s1._cached_chunk_ids is not None
+            assert 0 not in s1._cached_chunk_ids
+            assert s1._cached_matrix is not None
+            assert len(s1._cached_chunk_ids) == len(s1._cached_matrix)
+        except StoreError:
+            assert inserted_concurrently is True
+        finally:
+            s1._conn = real_conn
+
+
+def test_concurrent_delete_during_vector_cache_load(tmp_path):
+    """Penghapusan konkuren di antara count(*) dan fetch embedding tidak boleh meninggalkan chunk ID 0 atau vektor tak terisi."""
+    db_file = tmp_path / "delete_race.db"
+    doc1_path = tmp_path / "doc1.txt"
+    doc2_path = tmp_path / "doc2.txt"
+
+    v1 = _create_random_vectors(1, 384, seed=601)[0]
+    v2 = _create_random_vectors(1, 384, seed=602)[0]
+
+    with Store(db_file) as s1, Store(db_file) as s2:
+        s2.upsert_document(
+            doc1_path,
+            content_hash="h1",
+            size=10,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(doc1_path, ["Dokumen 1"]),
+            vectors=np.array([v1]),
+        )
+        s2.upsert_document(
+            doc2_path,
+            content_hash="h2",
+            size=20,
+            mtime_ns=2,
+            status="ok",
+            chunks=_create_mock_chunks(doc2_path, ["Dokumen 2"]),
+            vectors=np.array([v2]),
+        )
+
+        real_conn = s1._conn
+        assert real_conn is not None
+        deleted_concurrently = False
+
+        class _InterceptingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                nonlocal deleted_concurrently
+                res = self._cur.execute(sql, *args, **kwargs)
+                if "SELECT count(*) FROM chunks" in sql and not deleted_concurrently:
+                    s2.remove_document(doc2_path)
+                    deleted_concurrently = True
+                return res
+
+            def fetchone(self) -> Any:
+                return self._cur.fetchone()
+
+            def fetchall(self) -> Any:
+                return self._cur.fetchall()
+
+            def __iter__(self) -> Any:
+                return iter(self._cur)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+        class _InterceptingConn:
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def cursor(self) -> Any:
+                return _InterceptingCursor(self._conn.cursor())
+
+            def rollback(self) -> Any:
+                return self._conn.rollback()
+
+            @property
+            def in_transaction(self) -> bool:
+                return self._conn.in_transaction
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._conn, name)
+
+        s1._conn = _InterceptingConn(real_conn)  # type: ignore
+
+        try:
+            s1.search(v1, top_k=5)
+            assert deleted_concurrently is True
+            assert s1._cached_chunk_ids is not None
+            assert 0 not in s1._cached_chunk_ids
+            assert s1._cached_matrix is not None
+            for row in s1._cached_matrix:
+                norm = float(np.linalg.norm(row))
+                assert 0.99 <= norm <= 1.01
+        finally:
+            s1._conn = real_conn
+
+
+def test_failed_search_releases_read_transaction(tmp_path):
+    """Kegagalan di tengah search/load_vector_cache harus merollback transaksi baca sehingga upsert berikutnya tetap berhasil."""
+    import sqlite3
+
+    db_file = tmp_path / "rollback_test.db"
+    doc1 = tmp_path / "doc1.txt"
+    doc2 = tmp_path / "doc2.txt"
+
+    v = _create_random_vectors(1, 384, seed=701)
+
+    with Store(db_file) as s:
+        s.upsert_document(
+            doc1,
+            content_hash="h1",
+            size=10,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(doc1, ["Teks 1"]),
+            vectors=v,
+        )
+
+        real_conn = s._conn
+        assert real_conn is not None
+
+        class _FailingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                if "SELECT id, embedding FROM chunks" in sql:
+                    raise sqlite3.OperationalError("Simulasi error baca")
+                return self._cur.execute(sql, *args, **kwargs)
+
+            def fetchone(self) -> Any:
+                return self._cur.fetchone()
+
+            def fetchall(self) -> Any:
+                return self._cur.fetchall()
+
+            def __iter__(self) -> Any:
+                return iter(self._cur)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+        class _FailingConn:
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def cursor(self) -> Any:
+                return _FailingCursor(self._conn.cursor())
+
+            def rollback(self) -> Any:
+                return self._conn.rollback()
+
+            @property
+            def in_transaction(self) -> bool:
+                return self._conn.in_transaction
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._conn, name)
+
+        s._conn = _FailingConn(real_conn)  # type: ignore
+
+        with pytest.raises(StoreError, match="Gagal memuat cache vektor"):
+            s.search(v[0])
+
+        # Pulihkan koneksi asli
+        s._conn = real_conn
+
+        # upsert_document pada store yang SAMA harus tetap berhasil tanpa terhalang transaksi lama
+        s.upsert_document(
+            doc2,
+            content_hash="h2",
+            size=20,
+            mtime_ns=2,
+            status="ok",
+            chunks=_create_mock_chunks(doc2, ["Teks 2"]),
+            vectors=v,
+        )
+
+        assert len(s.list_documents()) == 2
+        assert s.get_document(doc2) is not None
