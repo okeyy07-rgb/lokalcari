@@ -194,6 +194,9 @@ class Store:
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
         """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(content_hash);
+        """)
 
         cur.execute("SELECT key, value FROM meta;")
         meta = dict(cur.fetchall())
@@ -406,6 +409,85 @@ class Store:
             return removed
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
             raise self._handle_sqlite_error(e, "Gagal menghapus dokumen") from e
+
+    def find_documents_by_hash(self, content_hash: str) -> list[DocumentRecord]:
+        """Mencari dokumen berdasarkan content_hash dengan status 'ok' atau 'empty', urut id."""
+        conn = self._ensure_open()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT path, content_hash, size, mtime_ns, status, error, chunk_count, indexed_at
+                FROM documents
+                WHERE content_hash = ? AND status IN ('ok', 'empty')
+                ORDER BY id ASC;
+                """,
+                (content_hash,),
+            )
+            rows = cur.fetchall()
+            return [
+                DocumentRecord(
+                    path=Path(r[0]),
+                    content_hash=r[1],
+                    size=r[2],
+                    mtime_ns=r[3],
+                    status=r[4],
+                    error=r[5],
+                    chunk_count=r[6],
+                    indexed_at=r[7],
+                )
+                for r in rows
+            ]
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+            raise self._handle_sqlite_error(
+                e, "Gagal mencari dokumen berdasarkan hash"
+            ) from e
+
+    def get_document_chunks(self, path: Path | str) -> tuple[list[Chunk], np.ndarray]:
+        """Mengambil chunk dan matriks vektor untuk dokumen tertentu.
+
+        Mengembalikan (list[Chunk], ndarray float32 shape (n, dim)).
+        Dokumen tidak ada atau tanpa chunk menghasilkan ([], array (0, dim)).
+        Chunk diurutkan berdasarkan chunk_index.
+        """
+        conn = self._ensure_open()
+        resolved_path = str(Path(path).resolve())
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM documents WHERE path = ?;",
+                (resolved_path,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return [], np.empty((0, self.embedding_dim), dtype=np.float32)
+            doc_id = row[0]
+
+            cur.execute(
+                """
+                SELECT chunk_index, page, text, embedding
+                FROM chunks
+                WHERE document_id = ?
+                ORDER BY chunk_index ASC;
+                """,
+                (doc_id,),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return [], np.empty((0, self.embedding_dim), dtype=np.float32)
+
+            chunks: list[Chunk] = []
+            matrix = np.empty((len(rows), self.embedding_dim), dtype=np.float32)
+            source = Path(resolved_path)
+            for i, (chunk_index, page, text, blob) in enumerate(rows):
+                chunks.append(
+                    Chunk(text=text, source=source, page=page, index=chunk_index)
+                )
+                matrix[i] = np.frombuffer(blob, dtype=np.float32)
+
+            return chunks, matrix
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+            raise self._handle_sqlite_error(e, "Gagal mengambil chunk dokumen") from e
 
     def _load_vector_cache(self) -> None:
         """Memuat semua vektor dan ID chunk dari database ke memori."""
