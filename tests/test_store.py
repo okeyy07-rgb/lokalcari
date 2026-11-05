@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -714,3 +715,139 @@ def test_locked_database_raises_store_error(tmp_path):
         hits = s_verify.search(init_v[0], top_k=5)
         assert len(hits) == 1
         assert hits[0].text == "Teks awal"
+
+
+def test_data_version_read_before_load_avoids_stale_cache(tmp_path):
+    """Pembacaan data_version sebelum pemuatan vektor mencegah cache basi saat ada penulisan konkuren."""
+    db_file = tmp_path / "race.db"
+    doc1_path = tmp_path / "doc1.txt"
+    doc2_path = tmp_path / "doc2.txt"
+
+    v1 = _create_random_vectors(1, 384, seed=301)[0]
+    v2 = _create_random_vectors(1, 384, seed=302)[0]
+
+    with Store(db_file) as s1, Store(db_file) as s2:
+        s2.upsert_document(
+            doc1_path,
+            content_hash="h1",
+            size=10,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(doc1_path, ["Dokumen pertama"]),
+            vectors=np.array([v1]),
+        )
+
+        real_conn = s1._conn
+        assert real_conn is not None
+        inserted_concurrently = False
+
+        class _InterceptingCursor:
+            def __init__(self, cur: Any) -> None:
+                self._cur = cur
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                nonlocal inserted_concurrently
+                res = self._cur.execute(sql, *args, **kwargs)
+                if (
+                    "SELECT id, embedding FROM chunks" in sql
+                    and not inserted_concurrently
+                ):
+                    s2.upsert_document(
+                        doc2_path,
+                        content_hash="h2",
+                        size=20,
+                        mtime_ns=2,
+                        status="ok",
+                        chunks=_create_mock_chunks(doc2_path, ["Dokumen kedua"]),
+                        vectors=np.array([v2]),
+                    )
+                    inserted_concurrently = True
+                return res
+
+            def fetchone(self) -> Any:
+                return self._cur.fetchone()
+
+            def fetchall(self) -> Any:
+                return self._cur.fetchall()
+
+            def __iter__(self) -> Any:
+                return iter(self._cur)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cur, name)
+
+        class _InterceptingConn:
+            def __init__(self, conn: Any) -> None:
+                self._conn = conn
+
+            def cursor(self) -> Any:
+                return _InterceptingCursor(self._conn.cursor())
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._conn, name)
+
+        s1._conn = _InterceptingConn(real_conn)  # type: ignore
+
+        # Search pertama memicu pemuatan cache.
+        # Saat query SELECT id, embedding dijalankan, s2 menyisipkan dokumen kedua secara konkuren.
+        hits_1 = s1.search(v1, top_k=5)
+        assert len(hits_1) == 1
+        assert hits_1[0].text == "Dokumen pertama"
+        assert inserted_concurrently is True
+
+        # Search kedua tanpa penulisan lain harus menemukan dokumen baru
+        hits_2 = s1.search(v2, top_k=5)
+        assert len(hits_2) == 2
+        assert any(h.text == "Dokumen kedua" for h in hits_2)
+
+        # Pulihkan koneksi asli agar s1.close() tertib
+        s1._conn = real_conn
+
+
+def test_chunk_ids_autoincrement_never_reused(tmp_path):
+    """Skema chunks dengan AUTOINCREMENT menjamin ID chunk baru lebih besar dari ID lama."""
+    import sqlite3
+
+    db_file = tmp_path / "autoincrement.db"
+    doc_path = tmp_path / "doc.txt"
+
+    v1 = _create_random_vectors(2, 384, seed=401)
+    v2 = _create_random_vectors(2, 384, seed=402)
+
+    with Store(db_file) as s:
+        s.upsert_document(
+            doc_path,
+            content_hash="h1",
+            size=100,
+            mtime_ns=1,
+            status="ok",
+            chunks=_create_mock_chunks(doc_path, ["Teks A", "Teks B"]),
+            vectors=v1,
+        )
+
+    # Baca ID chunk awal via koneksi terpisah
+    conn_raw = sqlite3.connect(str(db_file))
+    cur = conn_raw.cursor()
+    cur.execute("SELECT id FROM chunks ORDER BY id ASC;")
+    first_ids = [r[0] for r in cur.fetchall()]
+    assert len(first_ids) == 2
+
+    # Upsert kedua untuk path yang sama dengan jumlah chunk yang sama
+    with Store(db_file) as s:
+        s.upsert_document(
+            doc_path,
+            content_hash="h2",
+            size=100,
+            mtime_ns=2,
+            status="ok",
+            chunks=_create_mock_chunks(doc_path, ["Teks C", "Teks D"]),
+            vectors=v2,
+        )
+
+    cur.execute("SELECT id FROM chunks ORDER BY id ASC;")
+    second_ids = [r[0] for r in cur.fetchall()]
+    conn_raw.close()
+
+    assert len(second_ids) == 2
+    # Semua ID chunk setelah upsert kedua harus lebih besar dari semua ID sebelumnya
+    assert min(second_ids) > max(first_ids)
