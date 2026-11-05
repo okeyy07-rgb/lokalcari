@@ -412,35 +412,50 @@ class Store:
         conn = self._ensure_open()
         try:
             cur = conn.cursor()
-            # Baca data_version sebelum memuat data agar penulisan dari koneksi lain
-            # di tengah proses pemuatan tidak tertutup oleh versi yang lebih baru.
+            # Baca data_version paling awal sebelum transaksi dimulai
             cur.execute("PRAGMA data_version;")
             row = cur.fetchone()
             initial_data_version = row[0] if row else 0
 
-            cur.execute("SELECT count(*) FROM chunks;")
-            total_chunks = cur.fetchone()[0]
+            # Jalankan count(*) dan fetch embedding dalam satu transaksi baca eksplisit
+            # agar keduanya melihat snapshot yang konsisten.
+            conn.execute("BEGIN;")
+            try:
+                cur.execute("SELECT count(*) FROM chunks;")
+                total_chunks = cur.fetchone()[0]
 
-            if total_chunks == 0:
-                self._cached_matrix = np.empty(
-                    (0, self.embedding_dim), dtype=np.float32
-                )
-                self._cached_chunk_ids = []
-            else:
-                matrix = np.empty((total_chunks, self.embedding_dim), dtype=np.float32)
-                chunk_ids = [0] * total_chunks
+                if total_chunks == 0:
+                    self._cached_matrix = np.empty(
+                        (0, self.embedding_dim), dtype=np.float32
+                    )
+                    self._cached_chunk_ids = []
+                else:
+                    matrix = np.empty(
+                        (total_chunks, self.embedding_dim), dtype=np.float32
+                    )
+                    chunk_ids = [0] * total_chunks
 
-                cur.execute("SELECT id, embedding FROM chunks ORDER BY id ASC;")
-                for i, (cid, blob) in enumerate(cur):
-                    chunk_ids[i] = cid
-                    matrix[i] = np.frombuffer(blob, dtype=np.float32)
+                    cur.execute("SELECT id, embedding FROM chunks ORDER BY id ASC;")
+                    for i, (cid, blob) in enumerate(cur):
+                        chunk_ids[i] = cid
+                        matrix[i] = np.frombuffer(blob, dtype=np.float32)
 
-                self._cached_matrix = matrix
-                self._cached_chunk_ids = chunk_ids
+                    self._cached_matrix = matrix
+                    self._cached_chunk_ids = chunk_ids
 
-            self._cached_data_version = initial_data_version
+                self._cached_data_version = initial_data_version
+            finally:
+                if conn.in_transaction:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
             raise self._handle_sqlite_error(e, "Gagal memuat cache vektor") from e
+        except StoreError:
+            raise
+        except Exception as e:
+            raise StoreError(f"Gagal memuat cache vektor: {e}") from e
 
     def search(self, query_vec: np.ndarray, top_k: int = 10) -> list[SearchHit]:
         """Mencari chunk terdekat menggunakan dot product vektor query."""
