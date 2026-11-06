@@ -1143,3 +1143,120 @@ def test_failed_search_releases_read_transaction(tmp_path):
 
         assert len(s.list_documents()) == 2
         assert s.get_document(doc2) is not None
+
+
+def test_idx_documents_hash_exists(tmp_path: Path) -> None:
+    """Index idx_documents_hash harus ada di sqlite_master."""
+    s = Store(tmp_path / "test.db")
+    assert s._conn is not None
+    rows = s._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_documents_hash'"
+    ).fetchall()
+    assert len(rows) == 1
+
+
+def test_find_documents_by_hash_filters_error_and_orders_by_id(tmp_path: Path) -> None:
+    """find_documents_by_hash hanya mengembalikan dokumen 'ok'/'empty' terurut id."""
+    s = Store(tmp_path / "test.db")
+    doc_ok1 = tmp_path / "ok1.txt"
+    doc_err = tmp_path / "err.txt"
+    doc_ok2 = tmp_path / "ok2.txt"
+    doc_empty = tmp_path / "empty.txt"
+
+    v = _create_random_vectors(1)
+    s.upsert_document(
+        doc_ok1,
+        content_hash="hash_same",
+        size=10,
+        mtime_ns=1,
+        status="ok",
+        chunks=_create_mock_chunks(doc_ok1, ["Teks 1"]),
+        vectors=v,
+    )
+    s.upsert_document(
+        doc_err,
+        content_hash="hash_same",
+        size=10,
+        mtime_ns=1,
+        status="error",
+        error="gagal baca",
+    )
+    s.upsert_document(
+        doc_ok2,
+        content_hash="hash_same",
+        size=10,
+        mtime_ns=1,
+        status="ok",
+        chunks=_create_mock_chunks(doc_ok2, ["Teks 2"]),
+        vectors=v,
+    )
+    s.upsert_document(
+        doc_empty,
+        content_hash="hash_same",
+        size=0,
+        mtime_ns=1,
+        status="empty",
+        error="kosong",
+    )
+
+    found = s.find_documents_by_hash("hash_same")
+    assert len(found) == 3
+    statuses = [d.status for d in found]
+    assert "error" not in statuses
+    assert statuses == ["ok", "ok", "empty"]
+    # Terurut id (ok1 masuk lebih dulu dari ok2, lalu empty)
+    paths = [d.path for d in found]
+    assert paths == [doc_ok1.resolve(), doc_ok2.resolve(), doc_empty.resolve()]
+
+
+def test_get_document_chunks_roundtrip_and_order(tmp_path: Path) -> None:
+    """get_document_chunks mengembalikan chunk terurut index dan vektor identik."""
+    s = Store(tmp_path / "test.db")
+    doc = tmp_path / "multi.txt"
+    n = 4
+    v = _create_random_vectors(n)
+    chunks = [
+        Chunk(f"Teks bagian {i}", doc, page=1 if i < 2 else 2, index=i)
+        for i in range(n)
+    ]
+    s.upsert_document(
+        doc,
+        content_hash="hash_multi",
+        size=100,
+        mtime_ns=1,
+        status="ok",
+        chunks=chunks,
+        vectors=v,
+    )
+
+    got_chunks, got_matrix = s.get_document_chunks(doc)
+    assert len(got_chunks) == n
+    assert got_matrix.shape == (n, 384)
+    for i in range(n):
+        assert got_chunks[i].index == i
+        assert got_chunks[i].text == f"Teks bagian {i}"
+        assert got_chunks[i].source == doc.resolve()
+        np.testing.assert_array_equal(got_matrix[i], v[i])
+
+
+def test_get_document_chunks_not_found_or_no_chunks(tmp_path: Path) -> None:
+    """Dokumen tidak ada atau tanpa chunk menghasilkan ([], array bentuk (0, dim))."""
+    s = Store(tmp_path / "test.db")
+    # Dokumen tidak ada
+    c1, m1 = s.get_document_chunks(tmp_path / "nonexistent.txt")
+    assert c1 == []
+    assert m1.shape == (0, 384)
+
+    # Dokumen empty tanpa chunk
+    doc_empty = tmp_path / "empty.txt"
+    s.upsert_document(
+        doc_empty,
+        content_hash="empty_hash",
+        size=0,
+        mtime_ns=1,
+        status="empty",
+        error="File kosong",
+    )
+    c2, m2 = s.get_document_chunks(doc_empty)
+    assert c2 == []
+    assert m2.shape == (0, 384)
