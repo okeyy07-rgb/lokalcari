@@ -208,6 +208,32 @@ class TestScanFolder:
 
         assert len(errors_found) >= 1
 
+    def test_scan_folder_reports_unreadable_dir_via_scandir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write(tmp_path / "ok" / "a.txt")
+        locked_dir = tmp_path / "terkunci"
+        _write(locked_dir / "b.txt")
+
+        errors_found: list[tuple[Path, Exception]] = []
+        original_scandir = os.scandir
+
+        def _mock_scandir(path: str | os.PathLike[str]) -> Any:
+            if os.path.basename(os.fspath(path)) == "terkunci":
+                raise PermissionError("akses ditolak")
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", _mock_scandir)
+        result = scan_folder(
+            tmp_path,
+            on_error=lambda path, error: errors_found.append((path, error)),
+        )
+
+        assert result == [(tmp_path / "ok" / "a.txt").resolve()]
+        assert len(errors_found) == 1
+        assert errors_found[0][0] == locked_dir
+        assert isinstance(errors_found[0][1], PermissionError)
+
     @pytest.mark.skipif(
         os.name != "nt" and not hasattr(os, "symlink"),
         reason="Symlink tidak tersedia",
@@ -496,6 +522,37 @@ class TestIndexFolder:
         assert report2.removed == 1
         assert store.get_document(fa) is None
         assert store.get_document(fb) is not None
+
+    def test_prune_skipped_when_dir_unreadable_keeps_documents(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        folder = tmp_path / "docs"
+        fa = folder / "ok" / "a.txt"
+        fb = folder / "terkunci" / "b.txt"
+        _write(fa, "Dokumen a yang tetap terbaca untuk diuji prune.")
+        _write(fb, "Dokumen b di folder yang tidak terbaca.")
+
+        store = _make_store(tmp_path)
+        embedder1, _ = _make_embedder()
+        index_folder(folder, store, embedder1)
+        assert store.get_document(fb) is not None
+
+        original_scandir = os.scandir
+
+        def _mock_scandir(path: str | os.PathLike[str]) -> Any:
+            if os.path.basename(os.fspath(path)) == "terkunci":
+                raise PermissionError("akses ditolak")
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", _mock_scandir)
+        embedder2, _ = _make_embedder()
+        report = index_folder(folder, store, embedder2)
+
+        assert report.prune_skipped_reason is not None
+        assert report.removed == 0
+        assert store.get_document(fb) is not None
+        hits = store.search(embedder2.embed_query("dokumen b"))
+        assert any(hit.path.resolve() == fb.resolve() for hit in hits)
 
     def test_prune_no_touch_outside_root(self, tmp_path: Path) -> None:
         """Dokumen di luar root tidak tersentuh saat prune."""

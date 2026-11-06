@@ -100,57 +100,62 @@ def scan_folder(
 
     exts = supported_extensions()
     result: list[Path] = []
+    pending_dirs = [root]
 
-    for dirpath_str, dirnames, filenames in os.walk(str(root), followlinks=False):
-        dirpath = Path(dirpath_str)
+    while pending_dirs:
+        dirpath = pending_dirs.pop()
 
-        # Filter subdirektori (modifikasi in-place untuk mencegah os.walk masuk ke sana)
-        filtered: list[str] = []
-        for d in dirnames:
-            # Lewati tersembunyi
-            if d.startswith("."):
-                continue
-            # Lewati ignore_dirs
-            if d in ignore_dirs:
-                continue
-            # Lewati symlink direktori
-            d_path = dirpath / d
-            try:
-                d_st = os.lstat(str(d_path))
-            except OSError as e:
-                if on_error is not None:
-                    on_error(d_path, e)
-                continue
-            if stat.S_ISLNK(d_st.st_mode):
-                continue
-            # Lewati reparse point / junction Windows (tapi BUKAN file ondemand)
-            if _is_reparse_point(d_st):
-                continue
-            filtered.append(d)
-        dirnames[:] = sorted(filtered)
+        def _walk_error(error: OSError, current_dir: Path = dirpath) -> None:
+            error_path = (
+                Path(error.filename) if error.filename is not None else current_dir
+            )
+            if on_error is not None:
+                on_error(error_path, error)
 
-        for fname in sorted(filenames):
-            # Lewati file tersembunyi
-            if fname.startswith("."):
-                continue
-            # Lewati file sementara Word/LibreOffice
-            if fname.startswith(("~$", ".~lock.")):
-                continue
+        # Walk satu tingkat saja supaya callback tahu direktori saat ini jika filename None.
+        for dirpath_str, dirnames, filenames in os.walk(
+            str(dirpath), followlinks=False, onerror=_walk_error
+        ):
+            current_path = Path(dirpath_str)
+            filtered: list[str] = []
+            for dirname in dirnames:
+                if dirname.startswith(".") or dirname in ignore_dirs:
+                    continue
 
-            fpath = dirpath / fname
-            ext = Path(fname).suffix.lower()
-            if ext not in exts:
-                continue
+                child_path = current_path / dirname
+                try:
+                    child_stat = os.lstat(str(child_path))
+                except OSError as e:
+                    if on_error is not None:
+                        on_error(child_path, e)
+                    continue
+                if stat.S_ISLNK(child_stat.st_mode) or _is_reparse_point(child_stat):
+                    continue
+                filtered.append(dirname)
 
-            # Lewati symlink file
-            try:
-                f_st = os.lstat(str(fpath))
-            except OSError:
-                continue
-            if stat.S_ISLNK(f_st.st_mode):
-                continue
+            pending_dirs.extend(
+                current_path / name for name in sorted(filtered, reverse=True)
+            )
+            dirnames.clear()
 
-            result.append(fpath.resolve())
+            for filename in sorted(filenames):
+                if filename.startswith((".", "~$", ".~lock.")):
+                    continue
+
+                file_path = current_path / filename
+                if Path(filename).suffix.lower() not in exts:
+                    continue
+
+                try:
+                    file_stat = os.lstat(str(file_path))
+                except OSError as e:
+                    if on_error is not None:
+                        on_error(file_path, e)
+                    continue
+                if stat.S_ISLNK(file_stat.st_mode):
+                    continue
+
+                result.append(file_path.resolve())
 
     return sorted(result)
 
@@ -457,9 +462,7 @@ def index_folder(
     elif cancelled:
         prune_skipped_reason = "Proses dibatalkan; pembersihan dilewati"
     elif scan_errors:
-        prune_skipped_reason = (
-            f"Ada {len(scan_errors)} direktori yang gagal dibaca; pembersihan dilewati"
-        )
+        prune_skipped_reason = f"Ada {len(scan_errors)} direktori/file yang gagal dibaca; pembersihan dilewati"
     else:
         # Periksa apakah ada dokumen di bawah root di store
         all_docs = store.list_documents()
